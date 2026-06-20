@@ -1,0 +1,49 @@
+{
+	"jobConfig": {
+		"name": "process_reviews_job",
+		"description": "",
+		"role": "arn:aws:iam::436820054268:role/AWSGlueServiceRole-Reviews",
+		"command": "glueetl",
+		"version": "5.1",
+		"runtime": null,
+		"workerType": "G.1X",
+		"numberOfWorkers": 10,
+		"maxCapacity": 10,
+		"jobRunQueuingEnabled": false,
+		"maxRetries": 0,
+		"timeout": 480,
+		"maxConcurrentRuns": 1,
+		"security": "none",
+		"scriptName": "process_reviews_job.py",
+		"scriptLocation": "s3://aws-glue-assets-436820054268-us-east-1/scripts/",
+		"language": "python-3",
+		"spark": true,
+		"sparkConfiguration": "standard",
+		"jobParameters": [
+			{
+				"key": "--conf",
+				"value": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+				"existing": false
+			}
+		],
+		"tags": [],
+		"jobMode": "DEVELOPER_MODE",
+		"createdOn": "2026-06-15T02:32:36.690Z",
+		"developerMode": true,
+		"connectionsList": [],
+		"temporaryDirectory": "s3://aws-glue-assets-436820054268-us-east-1/temporary/",
+		"logging": true,
+		"glueHiveMetastore": true,
+		"etlAutoTuning": true,
+		"metrics": true,
+		"observabilityMetrics": true,
+		"bookmark": "job-bookmark-disable",
+		"sparkPath": "s3://aws-glue-assets-436820054268-us-east-1/sparkHistoryLogs/",
+		"flexExecution": false,
+		"minFlexWorkers": null,
+		"maintenanceWindow": null
+	},
+	"hasBeenSaved": false,
+	"usageProfileName": null,
+	"script": "import sys\r\nfrom awsglue.transforms import *\r\nfrom awsglue.utils import getResolvedOptions\r\nfrom pyspark.context import SparkContext\r\nfrom awsglue.context import GlueContext\r\nfrom awsglue.job import Job\r\nfrom pyspark.sql.functions import col, to_date, upper, coalesce, lit\r\nfrom awsglue.dynamicframe import DynamicFrame\r\n\r\n## Initialize contexts\r\nsc = SparkContext()\r\nglueContext = GlueContext(sc)\r\nspark = glueContext.spark_session\r\njob = Job(glueContext)\r\n\r\n# --- Define S3 Paths (Updated with your new names) ---\r\ns3_input_path = \"s3://handsonfinallanding-pk/\"\r\ns3_processed_path = \"s3://handsonfinalprocessed-pk/processed-data/\"\r\ns3_analytics_path = \"s3://handsonfinalprocessed-pk/Athena Results/\"\r\n\r\n# --- Read the data from the S3 landing zone ---\r\ndynamic_frame = glueContext.create_dynamic_frame.from_options(\r\n    connection_type=\"s3\",\r\n    connection_options={\"paths\": [s3_input_path], \"recurse\": True},\r\n    format=\"csv\",\r\n    format_options={\"withHeader\": True, \"inferSchema\": True},\r\n)\r\n\r\n# Convert to a standard Spark DataFrame for easier transformation\r\ndf = dynamic_frame.toDF()\r\n\r\n# --- Perform Transformations ---\r\n# 1. Cast 'rating' to integer and fill null values with 0\r\ndf_transformed = df.withColumn(\"rating\", coalesce(col(\"rating\").cast(\"integer\"), lit(0)))\r\n\r\n# 2. Convert 'review_date' string to a proper date type\r\ndf_transformed = df_transformed.withColumn(\"review_date\", to_date(col(\"review_date\"), \"yyyy-MM-dd\"))\r\n\r\n# 3. Fill null review_text with a default string\r\ndf_transformed = df_transformed.withColumn(\"review_text\",\r\n    coalesce(col(\"review_text\"), lit(\"No review text\")))\r\n\r\n# 4. Convert product_id to uppercase for consistency\r\ndf_transformed = df_transformed.withColumn(\"product_id_upper\", upper(col(\"product_id\")))\r\n\r\n\r\n# --- Write the full transformed data to S3 (Good practice) ---\r\n# This saves the clean, complete dataset to the 'processed-data' folder\r\nglue_processed_frame = DynamicFrame.fromDF(df_transformed, glueContext, \"transformed_df\")\r\nglueContext.write_dynamic_frame.from_options(\r\n    frame=glue_processed_frame,\r\n    connection_type=\"s3\",\r\n    connection_options={\"path\": s3_processed_path},\r\n    format=\"csv\"\r\n)\r\n\r\n# --- Run Spark SQL Query within the Job ---\r\n\r\n# 1. Create a temporary view in Spark's memory\r\ndf_transformed.createOrReplaceTempView(\"product_reviews\")\r\n\r\n# 2. Run your SQL query\r\ndf_analytics_result = spark.sql(\"\"\"\r\n    SELECT \r\n        product_id_upper, \r\n        AVG(rating) as average_rating,\r\n        COUNT(*) as review_count\r\n    FROM product_reviews\r\n    GROUP BY product_id_upper\r\n    ORDER BY average_rating DESC\r\n\"\"\")\r\n\r\n# 3. Write the query's result DataFrame to your 'Athena Results' path\r\nprint(f\"Writing analytics results to {s3_analytics_path}...\")\r\n\r\n# repartition(1) writes the result as a single file\r\nanalytics_result_frame = DynamicFrame.fromDF(df_analytics_result.repartition(1), glueContext, \"analytics_df\")\r\nglueContext.write_dynamic_frame.from_options(\r\n    frame=analytics_result_frame,\r\n    connection_type=\"s3\",\r\n    connection_options={\"path\": s3_analytics_path},\r\n    format=\"csv\"\r\n)\r\n\r\n# Write the spark queries for following:\r\n# 2. Date wise review count: his query calculates the total number of reviews submitted per day.\r\ndf_q2 = spark.sql(\"\"\"\r\n    SELECT \r\n        review_date,\r\n        COUNT(*) as daily_review_count\r\n    FROM product_reviews\r\n    WHERE review_date IS NOT NULL\r\n    GROUP BY review_date\r\n    ORDER BY review_date ASC\r\n\"\"\")\r\n\r\nq2_frame = DynamicFrame.fromDF(df_q2.repartition(1), glueContext, \"daily_review_counts\")\r\nglueContext.write_dynamic_frame.from_options(\r\n    frame=q2_frame,\r\n    connection_type=\"s3\",\r\n    connection_options={\"path\": s3_analytics_path + \"daily_review_counts/\"},\r\n    format=\"csv\"\r\n)\r\n\r\n# 3. Top 5 Most Active Customers: This query identifies your \"power users\" by finding the customers who have submitted the most reviews.\r\ndf_q3 = spark.sql(\"\"\"\r\n    SELECT \r\n        customer_id,\r\n        COUNT(*) as review_count\r\n    FROM product_reviews\r\n    WHERE customer_id IS NOT NULL\r\n    GROUP BY customer_id\r\n    ORDER BY review_count DESC\r\n    LIMIT 5\r\n\"\"\")\r\n\r\nq3_frame = DynamicFrame.fromDF(df_q3.repartition(1), glueContext, \"top_5_customers\")\r\nglueContext.write_dynamic_frame.from_options(\r\n    frame=q3_frame,\r\n    connection_type=\"s3\",\r\n    connection_options={\"path\": s3_analytics_path + \"top_5_customers/\"},\r\n    format=\"csv\"\r\n)\r\n\r\n# 4. Overall Rating Distribution: This query shows the count for each star rating (1-star, 2-star, etc.)\r\ndf_q4 = spark.sql(\"\"\"\r\n    SELECT \r\n        rating,\r\n        COUNT(*) as count\r\n    FROM product_reviews\r\n    GROUP BY rating\r\n    ORDER BY rating ASC\r\n\"\"\")\r\n\r\nq4_frame = DynamicFrame.fromDF(df_q4.repartition(1), glueContext, \"rating_distribution\")\r\nglueContext.write_dynamic_frame.from_options(\r\n    frame=q4_frame,\r\n    connection_type=\"s3\",\r\n    connection_options={\"path\": s3_analytics_path + \"rating_distribution/\"},\r\n    format=\"csv\"\r\n)\r\n\r\n\r\njob.commit()\r\n"
+}
